@@ -3856,6 +3856,16 @@ static bool8 ReadIPSPatch (Stream *r, long offset, int32 &rom_size)
 	return (1);
 }
 
+bool CMemory::ApplyIPSPatch (const char *filename, long offset, int32 &rom_size)
+{
+	FSTREAM fp = OPEN_FSTREAM(filename, "rb");
+	if (!fp) return false;
+	Stream *s = new fStream(fp);
+	bool ret = ReadIPSPatch(s, offset, rom_size);
+	s->closeStream();
+	return ret;
+}
+
 #ifdef UNZIP_SUPPORT
 static int unzFindExtension (unzFile &file, const char *ext, bool restart, bool print, bool allowExact)
 {
@@ -3941,6 +3951,10 @@ void CMemory::CheckForAnyPatch(const char *rom_filename, bool8 header, int32 &ro
             return true;
         if (try_patch("UPS", S9xGetFilename(".ups", dirtype), ReadUPSPatch))
             return true;
+
+        if (Settings.IPSApplyCount == 0)
+            return false;
+
         if (try_patch("IPS", S9xGetFilename(".ips", dirtype), ReadIPSPatch))
             return true;
         if (try_ips_sequence(".%03d.ips", dirtype))
@@ -3997,14 +4011,16 @@ void CMemory::CheckForAnyPatch(const char *rom_filename, bool8 header, int32 &ro
                 try_zip_patch("bps", ReadBPSPatch);
             if (!flag)
                 try_zip_patch("ups", ReadUPSPatch);
-            if (!flag)
+            if (!flag && Settings.IPSApplyCount != 0)
+            {
                 try_zip_patch("ips", ReadIPSPatch);
-            if (!flag)
-                try_zip_ips_sequence("%03d.ips");
-            if (!flag)
-                try_zip_ips_sequence("ips%d");
-            if (!flag)
-                try_zip_ips_sequence("ip%d");
+                if (!flag)
+                    try_zip_ips_sequence("%03d.ips");
+                if (!flag)
+                    try_zip_ips_sequence("ips%d");
+                if (!flag)
+                    try_zip_ips_sequence("ip%d");
+            }
 
             int close_ret = unzClose(file);
             assert(close_ret == UNZ_OK);

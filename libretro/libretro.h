@@ -3371,6 +3371,8 @@ struct retro_core_option_display
    /* Specifies whether variable should be displayed
     * when presenting core options to the user */
    bool visible;
+
+   const char *label;
 };
 
 /* Maximum number of values permitted for a core option

@@ -193,6 +193,7 @@ void S9xLoadConfigFiles (char **argv, int argc)
 	Settings.ApplyCheats                =  conf.GetBool("ROM::Cheat",                          false);
 	Cheat.enabled = false;
 	Settings.NoPatch                    = !conf.GetBool("ROM::Patch",                          true);
+	Settings.IPSApplyCount              = -1;
 	Settings.IgnorePatchChecksum        =  conf.GetBool("ROM::IgnorePatchChecksum",            false);
 
 	Settings.ForceLoROM = conf.GetBool("ROM::LoROM", false);

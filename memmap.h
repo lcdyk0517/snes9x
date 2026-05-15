@@ -175,6 +175,7 @@ struct CMemory
 	void	ApplyROMFixes (void);
     std::string SafeString(std::string s, bool allow_jis = false);
 	void	CheckForAnyPatch (const char *, bool8, int32 &);
+	static bool	ApplyIPSPatch (const char *filename, long offset, int32 &rom_size);
 
 	void	MakeRomInfoText (char *);
 	std::string GetMultilineROMInfo();

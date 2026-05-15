@@ -303,6 +303,7 @@ struct SSettings
 	bool8	NoPatch;
 	bool8	IgnorePatchChecksum;
 	bool8	IsPatched;
+	int32	IPSApplyCount;
 	int32	AutoSaveDelay;
 	bool8	DontSaveOopsSnapshot;
 	bool8	UpAndDown;

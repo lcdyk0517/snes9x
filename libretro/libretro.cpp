@@ -20,10 +20,13 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#include <windows.h>
 #else
 #include <unistd.h>
+#include <dirent.h>
 #endif
 #include <sys/stat.h>
+#include <algorithm>
 #include <sys/types.h>
 #include <fcntl.h>
 #include "filter/snes_ntsc.h"
@@ -83,8 +86,20 @@ static uint16 *ntsc_screen_buffer, *snes_ntsc_buffer;
 
 const int MAX_SNES_WIDTH_NTSC = ((SNES_NTSC_OUT_WIDTH(256) + 3) / 4) * 4;
 
+#define MAX_IPS_PATCHES 20
+
 static bool show_lightgun_settings = true;
 static bool show_advanced_av_settings = true;
+static bool show_ips_patch_options = true;
+
+static std::vector<std::string> g_ips_patches_found;
+static int g_ips_priorities[MAX_IPS_PATCHES];
+static uint8 *g_original_rom = NULL;
+static int32 g_original_rom_size = 0;
+static std::string g_rom_stem;
+
+static void do_ips_reload(void);
+static void update_ips_option_labels(void);
 
 static void extract_basename(char *buf, const char *path, size_t size)
 {
@@ -99,10 +114,6 @@ static void extract_basename(char *buf, const char *path, size_t size)
 
     strncpy(buf, base, size - 1);
     buf[size - 1] = '\0';
-
-    char *ext = strrchr(buf, '.');
-    if (ext)
-        *ext = '\0';
 }
 
 static void extract_directory(char *buf, const char *path, size_t size)
@@ -233,6 +244,19 @@ void retro_set_environment(retro_environment_t cb)
 
         environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY,
                 &option_display);
+    }
+
+    {
+        struct retro_core_option_display option_display;
+        char ips_key[32];
+        option_display.visible = false;
+        option_display.label = NULL;
+        for (int i = 0; i < MAX_IPS_PATCHES; i++)
+        {
+            snprintf(ips_key, sizeof(ips_key), "snes9x_ips_patch_%d", i);
+            option_display.key = ips_key;
+            environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
+        }
     }
 
     static const struct retro_controller_description port_1[] = {
@@ -700,6 +724,70 @@ static void update_variables(void)
             if (old_filter != blargg_filter)
                 snes_ntsc_init( snes_ntsc, &setup );
         }
+    }
+
+    var.key = "snes9x_ips_patches";
+    var.value = NULL;
+
+    const char *ips_mode = "default";
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+        ips_mode = var.value;
+
+    bool ips_manual = !strcmp(ips_mode, "enabled");
+
+    if (ips_manual)
+    {
+        int new_priorities[MAX_IPS_PATCHES];
+        char key[32];
+        for (int i = 0; i < MAX_IPS_PATCHES; i++)
+        {
+            snprintf(key, sizeof(key), "snes9x_ips_patch_%d", i);
+            var.key = key;
+            var.value = NULL;
+            new_priorities[i] = -1;
+            if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+            {
+                if (strcmp(var.value, "disabled"))
+                    new_priorities[i] = atoi(var.value);
+            }
+        }
+
+        bool changed = false;
+        for (int i = 0; i < MAX_IPS_PATCHES; i++)
+        {
+            if (g_ips_priorities[i] != new_priorities[i])
+            {
+                changed = true;
+                break;
+            }
+        }
+
+        if (changed)
+        {
+            for (int i = 0; i < MAX_IPS_PATCHES; i++)
+                g_ips_priorities[i] = new_priorities[i];
+            if (g_original_rom && g_original_rom_size > 0)
+                do_ips_reload();
+        }
+    }
+    else
+    {
+        bool had_patches = false;
+        for (int i = 0; i < MAX_IPS_PATCHES; i++)
+        {
+            if (g_ips_priorities[i] >= 0)
+                had_patches = true;
+            g_ips_priorities[i] = -1;
+        }
+        if (had_patches && g_original_rom && g_original_rom_size > 0)
+            do_ips_reload();
+    }
+
+    {
+        bool show_ips_prev = show_ips_patch_options;
+        show_ips_patch_options = ips_manual;
+        if (show_ips_patch_options != show_ips_prev)
+            update_ips_option_labels();
     }
 
     /* Show/hide core options
@@ -1181,14 +1269,264 @@ static bool8 is_SufamiTurbo_Cart (const uint8 *data, uint32 size)
         return (FALSE);
 }
 
+static std::string extract_custom_name(const std::string &fullpath, const std::string &stem)
+{
+    size_t name_start = fullpath.find_last_of("/\\");
+    if (name_start == std::string::npos) name_start = 0; else name_start++;
+    std::string fname = fullpath.substr(name_start);
+    std::string prefix = stem + ".";
+    if (fname.size() > prefix.size() + 4 &&
+        strncmp(fname.c_str(), prefix.c_str(), prefix.size()) == 0 &&
+        fname.size() >= 4 &&
+        strcmp(fname.c_str() + fname.size() - 4, ".ips") == 0)
+    {
+        return fname.substr(prefix.size(), fname.size() - prefix.size() - 4);
+    }
+    return fname;
+}
+
+#ifdef _WIN32
+static std::vector<std::string> scan_custom_ips_patches(const char *rom_path)
+{
+    std::vector<std::string> patches;
+    std::string path(rom_path);
+    size_t slash = path.find_last_of("/\\");
+    size_t dot = path.find_last_of('.');
+    size_t name_start = (slash == std::string::npos) ? 0 : slash + 1;
+
+    std::string dir = path.substr(0, name_start);
+    std::string fname = path.substr(name_start);
+
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        fname = fname.substr(0, dot - (slash == std::string::npos ? 0 : slash + 1));
+
+    g_rom_stem = fname;
+    std::string prefix = fname + ".";
+    std::string pattern = dir + "*";
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            std::string name = fd.cFileName;
+            size_t plen = prefix.size();
+            if (name.size() > plen + 4 &&
+                strncmp(name.c_str(), prefix.c_str(), plen) == 0 &&
+                strcmp(name.c_str() + name.size() - 4, ".ips") == 0)
+            {
+                patches.push_back(dir + name);
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+
+    std::sort(patches.begin(), patches.end());
+    return patches;
+}
+#else
+static std::vector<std::string> scan_custom_ips_patches(const char *rom_path)
+{
+    std::vector<std::string> patches;
+    std::string path(rom_path);
+    size_t slash = path.find_last_of("/\\");
+    size_t dot = path.find_last_of('.');
+    size_t name_start = (slash == std::string::npos) ? 0 : slash + 1;
+
+    std::string dir = path.substr(0, name_start);
+    std::string fname = path.substr(name_start);
+
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        fname = fname.substr(0, dot - (slash == std::string::npos ? 0 : slash + 1));
+
+    g_rom_stem = fname;
+    std::string prefix = fname + ".";
+
+    DIR *d = opendir(dir.empty() ? "." : dir.c_str());
+    if (d)
+    {
+        struct dirent *entry;
+        while ((entry = readdir(d)))
+        {
+            std::string name = entry->d_name;
+            size_t plen = prefix.size();
+            if (name.size() > plen + 4 &&
+                strncmp(name.c_str(), prefix.c_str(), plen) == 0 &&
+                strcmp(name.c_str() + name.size() - 4, ".ips") == 0)
+            {
+                patches.push_back(dir + name);
+            }
+        }
+        closedir(d);
+    }
+
+    std::sort(patches.begin(), patches.end());
+    return patches;
+}
+#endif
+
+static char g_ips_label_bufs[MAX_IPS_PATCHES][256];
+
+static void update_ips_option_labels(void)
+{
+    static int patch_start_us = -1;
+    int num_found = (int)g_ips_patches_found.size();
+
+    if (patch_start_us < 0)
+    {
+        for (int j = 0; option_defs_us[j].key; j++)
+            if (strcmp(option_defs_us[j].key, "snes9x_ips_patch_0") == 0) { patch_start_us = j; break; }
+    }
+
+    for (int i = 0; i < MAX_IPS_PATCHES; i++)
+    {
+        if (i < num_found)
+        {
+            std::string label = extract_custom_name(g_ips_patches_found[i], g_rom_stem);
+            strncpy(g_ips_label_bufs[i], label.c_str(), sizeof(g_ips_label_bufs[i]) - 1);
+            g_ips_label_bufs[i][sizeof(g_ips_label_bufs[i]) - 1] = '\0';
+            if (patch_start_us >= 0)
+                option_defs_us[patch_start_us + i].desc = g_ips_label_bufs[i];
+        }
+    }
+
+    {
+        bool dummy = false;
+        libretro_set_core_options(environ_cb, &dummy);
+    }
+
+    {
+        struct retro_core_option_display option_display;
+        char ips_key[32];
+        for (int i = 0; i < MAX_IPS_PATCHES; i++)
+        {
+            snprintf(ips_key, sizeof(ips_key), "snes9x_ips_patch_%d", i);
+            option_display.key = ips_key;
+            if (i < num_found)
+            {
+                option_display.label = g_ips_label_bufs[i];
+                option_display.visible = show_ips_patch_options;
+            }
+            else
+            {
+                option_display.label = NULL;
+                option_display.visible = false;
+            }
+            environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
+        }
+    }
+}
+
+static void apply_selected_ips_patches(void)
+{
+    struct PatchEntry { int index; int priority; };
+    PatchEntry entries[MAX_IPS_PATCHES];
+    int count = 0;
+
+    for (int i = 0; i < (int)g_ips_patches_found.size() && i < MAX_IPS_PATCHES; i++)
+    {
+        if (g_ips_priorities[i] >= 0)
+        {
+            entries[count].index = i;
+            entries[count].priority = g_ips_priorities[i];
+            count++;
+        }
+    }
+
+    for (int i = 0; i < count - 1; i++)
+        for (int j = i + 1; j < count; j++)
+            if (entries[i].priority > entries[j].priority ||
+                (entries[i].priority == entries[j].priority && entries[i].index > entries[j].index))
+            {
+                PatchEntry tmp = entries[i];
+                entries[i] = entries[j];
+                entries[j] = tmp;
+            }
+
+    long offset = 0;
+    int32 rom_size = g_original_rom_size;
+
+    for (int i = 0; i < count; i++)
+    {
+        Memory.ApplyIPSPatch(g_ips_patches_found[entries[i].index].c_str(), offset, rom_size);
+    }
+}
+
+static void do_ips_reload(void)
+{
+    if (!g_original_rom || g_original_rom_size <= 0)
+        return;
+
+    Memory.SaveSRAM(S9xGetFilename(".srm", SRAM_DIR).c_str());
+
+    memcpy(Memory.ROM, g_original_rom, g_original_rom_size);
+    apply_selected_ips_patches();
+
+    S9xSoftReset();
+    g_geometry_update = true;
+}
+
 bool retro_load_game(const struct retro_game_info *game)
 {
     init_descriptors();
 
     update_variables();
 
+    g_ips_patches_found.clear();
+    if (g_original_rom) { free(g_original_rom); g_original_rom = NULL; }
+    g_original_rom_size = 0;
+
+    /* Determine IPS mode */
+    struct retro_variable var;
+    var.key = "snes9x_ips_patches";
+    var.value = NULL;
+    const char *ips_mode = "default";
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+        ips_mode = var.value;
+
+    bool ips_manual = !strcmp(ips_mode, "enabled");
+    bool ips_off    = !strcmp(ips_mode, "disabled");
+
+    Settings.NoPatch = ips_off;
+    Settings.IPSApplyCount = ips_manual ? 0 : -1;
+
     if(game->data == NULL && game->size == 0 && game->path != NULL)
+    {
+        extract_directory(g_rom_dir, game->path, sizeof(g_rom_dir));
+        extract_basename(g_basename, game->path, sizeof(g_basename));
+
+        if (ips_manual)
+        {
+            g_ips_patches_found = scan_custom_ips_patches(game->path);
+
+            if (!g_ips_patches_found.empty() && log_cb)
+            {
+                std::string msg = "IPS patches found (A-Z order): ";
+                for (size_t i = 0; i < g_ips_patches_found.size(); i++)
+                {
+                    if (i > 0) msg += ", ";
+                    msg += extract_custom_name(g_ips_patches_found[i], g_rom_stem);
+                }
+                log_cb(RETRO_LOG_INFO, "%s\n", msg.c_str());
+            }
+        }
+
         rom_loaded = Memory.LoadROM(game->path);
+
+        if (rom_loaded)
+        {
+            if (ips_manual)
+            {
+                g_original_rom_size = (int32)Memory.CalculatedSize;
+                g_original_rom = (uint8 *)malloc(g_original_rom_size);
+                if (g_original_rom)
+                    memcpy(g_original_rom, Memory.ROM, g_original_rom_size);
+
+                apply_selected_ips_patches();
+            }
+        }
+    }
     else
     {
         uint8 *biosrom = new uint8[0x100000];
@@ -1197,6 +1535,9 @@ bool retro_load_game(const struct retro_game_info *game)
         {
             extract_basename(g_basename, game->path, sizeof(g_basename));
             extract_directory(g_rom_dir, game->path, sizeof(g_rom_dir));
+
+            if (ips_manual)
+                g_ips_patches_found = scan_custom_ips_patches(game->path);
         }
 
         if (is_SufamiTurbo_Cart((uint8 *) game->data, game->size)) {
@@ -1213,12 +1554,27 @@ bool retro_load_game(const struct retro_game_info *game)
         else
             rom_loaded = Memory.LoadROMMem((const uint8_t*)game->data ,game->size, g_basename);
 
+        if (rom_loaded)
+        {
+            if (ips_manual)
+            {
+                g_original_rom_size = (int32)Memory.CalculatedSize;
+                g_original_rom = (uint8 *)malloc(g_original_rom_size);
+                if (g_original_rom)
+                    memcpy(g_original_rom, Memory.ROM, g_original_rom_size);
+
+                apply_selected_ips_patches();
+            }
+        }
+
         if(biosrom) delete[] biosrom;
     }
 
+    if (ips_manual)
+        update_ips_option_labels();
+
     if (rom_loaded)
     {
-        /* If we're in RGB565 format, switch frontend to that */
         if (RED_SHIFT_BITS == 11)
         {
             enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
@@ -1379,7 +1735,23 @@ bool retro_load_game_special(unsigned game_type, const struct retro_game_info *i
 }
 
 void retro_unload_game(void)
-{}
+{
+    struct retro_core_option_display option_display;
+    char ips_key[32];
+
+    for (int i = 0; i < MAX_IPS_PATCHES; i++)
+    {
+        snprintf(ips_key, sizeof(ips_key), "snes9x_ips_patch_%d", i);
+        option_display.key = ips_key;
+        option_display.visible = false;
+        option_display.label = NULL;
+        environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
+    }
+
+    g_ips_patches_found.clear();
+    if (g_original_rom) { free(g_original_rom); g_original_rom = NULL; }
+    g_original_rom_size = 0;
+}
 
 static void map_buttons();
 
@@ -1437,6 +1809,9 @@ void retro_init(void)
     Settings.CartBName[0] = 0;
     Settings.AutoSaveDelay = 1;
     Settings.DontSaveOopsSnapshot = TRUE;
+    Settings.IPSApplyCount = -1;
+    for (int i = 0; i < MAX_IPS_PATCHES; i++)
+        g_ips_priorities[i] = -1;
     Settings.ChannelsVolumePercent[0] = 100;
     Settings.ChannelsVolumePercent[1] = 100;
     Settings.ChannelsVolumePercent[2] = 100;
@@ -2018,6 +2393,7 @@ void retro_deinit()
 
     free(screen_buffer);
     free(ntsc_screen_buffer);
+    if (g_original_rom) { free(g_original_rom); g_original_rom = NULL; }
 
     libretro_supports_option_categories = false;
     libretro_supports_bitmasks = false;
